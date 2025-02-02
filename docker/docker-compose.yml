@@ -1,0 +1,12 @@
+version: '3'
+services:
+  experimental:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8888:8888"
+    volumes:
+      - ../:/app
+    environment:
+      - JUPYTER_TOKEN=experimental  # Set a token for Jupyter access
