@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import json
 import scipy.stats as stats
+from tabulate import tabulate
 
 # Configure logging with a more detailed format
 logging.basicConfig(
@@ -311,7 +312,7 @@ class AdvancedBanditTestGroup(ExperimentGroup):
             if metric in metrics_data.columns:
                 # Calculate mean and confidence intervals for each variant
                 variant_stats = {}
-                for variant in self.variants:
+                for variant in self.config.variants:
                     variant_data = metrics_data.filter(pl.col('variant') == variant)
                     if variant_data.height > 0:
                         variant_stats[variant] = {
@@ -383,17 +384,16 @@ class EnhancedLoyaltyExperiment(BaseExperiment):
             
             # Calculate metric statistics
             metric_stats = self._calculate_metric_statistics(metrics_data, metric)
-            results[f'metric_{metric}'] = metric_stats
+            results[f'{metric}_stats'] = metric_stats
             
             # Determine success for this metric
-            success = self._is_metric_successful(metric_stats, adjusted_alpha if self.sequential_test else 0.05)
+            adjusted_alpha = (
+                self.sequential_test.get_adjusted_alpha()
+                if self.sequential_test
+                else 0.05
+            )
+            success = self._is_metric_successful(metric_stats, adjusted_alpha)
             results[f'{metric}_success'] = success
-            
-            # Log results
-            logger.info(f"Results for metric {metric}:")
-            logger.info(f"  Effect size: {metric_stats['effect_size']:.4f}")
-            logger.info(f"  P-value: {metric_stats['p_value']:.4f}")
-            logger.info(f"  Success: {success}")
             
             # Cross-validation results
             cv_results = self.cross_validation.split_data(metrics_data, metric)
@@ -406,60 +406,137 @@ class EnhancedLoyaltyExperiment(BaseExperiment):
         
         # Overall experiment success
         results['overall_success'] = self._determine_overall_success(results)
-        logger.info(f"Overall experiment success: {results['overall_success']}")
+        
+        # Display results in table format
+        self._display_results_table(results)
         
         return results
     
-    def _calculate_metric_statistics(self, data: pl.DataFrame, metric: str) -> Dict[str, float]:
+    def _calculate_metric_statistics(self, data: pl.DataFrame, metric: str) -> Dict[str, Any]:
         """Calculate key statistics for a metric."""
         control_data = data.filter(pl.col('variant') == 'control').select(pl.col(metric)).to_numpy().flatten()
-        treatment_data = data.filter(pl.col('variant') != 'control').select(pl.col(metric)).to_numpy().flatten()
         
-        # Calculate effect size (Cohen's d)
-        effect_size = (np.mean(treatment_data) - np.mean(control_data)) / np.sqrt(
-            ((len(control_data) - 1) * np.var(control_data) + 
-             (len(treatment_data) - 1) * np.var(treatment_data)) / 
-            (len(control_data) + len(treatment_data) - 2)
-        )
-        
-        # Perform t-test
-        t_stat, p_value = stats.ttest_ind(control_data, treatment_data)
-        
-        return {
-            'effect_size': effect_size,
-            'p_value': p_value,
-            't_statistic': t_stat,
-            'control_mean': float(np.mean(control_data)),
-            'treatment_mean': float(np.mean(treatment_data)),
-            'control_std': float(np.std(control_data)),
-            'treatment_std': float(np.std(treatment_data))
-        }
+        # Calculate statistics for each treatment variant
+        variant_stats = {}
+        for variant in self.config.variants:
+            if variant == 'control':
+                continue
+                
+            variant_data = data.filter(pl.col('variant') == variant).select(pl.col(metric)).to_numpy().flatten()
+            
+            # Calculate effect size (Cohen's d)
+            pooled_std = np.sqrt((np.var(control_data) + np.var(variant_data)) / 2)
+            effect_size = (np.mean(variant_data) - np.mean(control_data)) / pooled_std if pooled_std != 0 else 0
+            
+            # Perform t-test
+            t_stat, p_value = stats.ttest_ind(variant_data, control_data)
+            
+            variant_stats[variant] = {
+                'effect_size': effect_size,
+                'p_value': p_value,
+                't_statistic': t_stat,
+                'control_mean': np.mean(control_data),
+                'treatment_mean': np.mean(variant_data),
+                'control_std': np.std(control_data),
+                'treatment_std': np.std(variant_data),
+                'lift_percentage': ((np.mean(variant_data) - np.mean(control_data)) / np.mean(control_data)) * 100
+            }
+            
+        return variant_stats
     
-    def _is_metric_successful(self, stats: Dict[str, float], alpha: float) -> bool:
-        """Determine if a metric shows significant improvement."""
-        return (
-            stats['p_value'] < alpha and  # Statistically significant
-            stats['effect_size'] > 0.2 and  # At least small positive effect size
-            stats['treatment_mean'] > stats['control_mean']  # Positive improvement
-        )
-    
+    def _is_metric_successful(self, variant_stats: Dict[str, Dict[str, float]], alpha: float) -> Dict[str, bool]:
+        """Determine if a metric shows significant improvement for each variant."""
+        success_by_variant = {}
+        for variant, stats in variant_stats.items():
+            # A metric is successful if:
+            # 1. It's statistically significant (p < alpha)
+            # 2. Has meaningful positive effect size (> 0.2)
+            success_by_variant[variant] = (
+                stats['p_value'] < alpha and
+                stats['effect_size'] > 0.2
+            )
+        return success_by_variant
+
+    def _display_results_table(self, results: Dict[str, Any]) -> None:
+        """Display experiment results in a formatted table."""
+        from tabulate import tabulate
+        
+        # Prepare table data
+        table_data = []
+        headers = ["Metric", "Variant", "Effect Size", "P-Value", "Control Mean", "Treatment Mean", "Lift %", "Success"]
+        
+        for metric in self.config.metrics:
+            if f"{metric}_stats" in results:
+                variant_stats = results[f"{metric}_stats"]
+                variant_success = results[f"{metric}_success"]
+                
+                # Add row for each variant
+                for variant in self.config.variants:
+                    if variant == 'control':
+                        continue
+                    
+                    stats = variant_stats[variant]
+                    table_data.append([
+                        metric,
+                        variant,
+                        f"{stats['effect_size']:.4f}",
+                        f"{stats['p_value']:.4f}",
+                        f"{stats['control_mean']:.2f}",
+                        f"{stats['treatment_mean']:.2f}",
+                        f"{stats['lift_percentage']:.1f}%",
+                        "✓" if variant_success[variant] else "✗"
+                    ])
+                
+                # Add separator between metrics
+                if metric != self.config.metrics[-1]:
+                    table_data.append(["-" * len(col) for col in headers])
+        
+        # Add overall result
+        table_data.append(["-" * len(col) for col in headers])
+        table_data.append([
+            "Overall",
+            "All Variants",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "✓" if results["overall_success"] else "✗"
+        ])
+        
+        # Display the table
+        table = tabulate(table_data, headers=headers, tablefmt="grid")
+        logger.info("\nExperiment Results Summary:\n" + table)
+
     def _determine_overall_success(self, results: Dict[str, Any]) -> bool:
         """Determine if the experiment was successful overall."""
-        # Get success status for each metric
-        metric_successes = [
-            results.get(f'{metric}_success', False)
-            for metric in self.config.metrics
-        ]
+        # Check if any variant shows significant improvement in any metric
+        has_significant_improvement = False
+        has_significant_degradation = False
         
-        # Experiment is successful if at least one metric shows improvement
-        # without any metrics showing significant degradation
-        return any(metric_successes) and all(
-            not (
-                results[f'metric_{metric}']['p_value'] < 0.05 and
-                results[f'metric_{metric}']['effect_size'] < -0.2
-            )
-            for metric in self.config.metrics
-        )
+        for metric in self.config.metrics:
+            for variant, stats in results[f'{metric}_stats'].items():
+                if variant == 'control':
+                    continue
+                    
+                # Check for significant improvement
+                if (stats['p_value'] < 0.05 and 
+                    stats['effect_size'] > 0.2 and 
+                    stats['lift_percentage'] > 0):
+                    has_significant_improvement = True
+                
+                # Check for significant degradation
+                if (stats['p_value'] < 0.05 and 
+                    (stats['effect_size'] < -0.2 or 
+                     stats['lift_percentage'] < -5)):  # 5% degradation threshold
+                    has_significant_degradation = True
+        
+        # Experiment is successful if:
+        # 1. At least one metric in one variant shows significant improvement
+        # 2. No metric in any variant shows significant degradation
+        # 3. No concerning negative trends even if not significant
+        return (has_significant_improvement and 
+                not has_significant_degradation)
 
 def run_enhanced_loyalty_experiment():
     """Run enhanced experiment with all features."""
